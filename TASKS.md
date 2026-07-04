@@ -8,6 +8,9 @@
 - **Call routing** — `tools/call` proxied to the correct downstream. Unknown tools → clear error
 - **`mcp_router_call` proxy** — for clients with frozen toolsets (prompt caching). `select` returns tools with `inputSchema`, `call` proxies execution. No `/reset` needed on new downstream tools
 - **Cross-platform** — tested on Windows (npx via `cmd /c`, config discovery via `MCP_ROUTER_CONFIG` env). Works with Claude Code and Hermes
+- **HTTP/SSE downstream transport** — `transport: http|sse` + `url` in config connects remote MCP (GitMCP, Cloudflare Remote MCP). stdio stays the default
+- **Env-var config** — `MCP_SIEVE_DOWNSTREAM_<N>_*` and embeddings overrides, for Docker/k8s with no config file. Merges over yaml by name
+- **Auto-reconnect** — per-downstream supervisor tasks with `send_ping` liveness + exponential backoff. A crashed downstream (Ollama, npx) self-heals instead of being lost until restart
 
 ## Benchmark
 
@@ -27,7 +30,4 @@ Tested with **9 downstream servers (74 tools)** in Claude Code across 5 long tas
 
 ## Planned
 
-- HTTP transport support for downstream servers
-- Config via env vars (beyond `MCP_ROUTER_CONFIG`)
-- Auto-reconnect for crashed downstream servers
-- FAISS for >1000 tools (currently numpy cosine sim)
+- FAISS for >1000 tools (currently numpy cosine sim) — deferred; numpy is fine below ~1000 tools

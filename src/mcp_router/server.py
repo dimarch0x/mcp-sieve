@@ -26,7 +26,9 @@ import httpx
 import numpy as np
 import yaml
 from mcp import ClientSession, StdioServerParameters
+from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamablehttp_client
 from mcp.server import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, EmbeddedResource, ImageContent, TextContent, Tool
@@ -54,12 +56,60 @@ def _find_config() -> Path:
 CONFIG_PATH = _find_config()
 
 
+def _env_downstream() -> list[dict]:
+    """Read MCP_SIEVE_DOWNSTREAM_<N>_* env vars into downstream entries.
+
+    ponytail: for Docker/k8s where mounting a file is a pain. N starts at 1,
+    stops at the first gap. _ARGS is a JSON array (for quoting/backslashes) or
+    plain whitespace-split. _URL/_TRANSPORT enable HTTP/SSE downstream.
+    """
+    out: list[dict] = []
+    n = 1
+    while True:
+        name = os.environ.get(f"MCP_SIEVE_DOWNSTREAM_{n}_NAME")
+        if not name:
+            break
+        entry: dict = {"name": name}
+        for key, field in (("COMMAND", "command"), ("URL", "url"), ("TRANSPORT", "transport")):
+            val = os.environ.get(f"MCP_SIEVE_DOWNSTREAM_{n}_{key}")
+            if val:
+                entry[field] = val
+        raw_args = os.environ.get(f"MCP_SIEVE_DOWNSTREAM_{n}_ARGS")
+        if raw_args:
+            entry["args"] = json.loads(raw_args) if raw_args.lstrip().startswith("[") else raw_args.split()
+        out.append(entry)
+        n += 1
+    return out
+
+
+def _apply_env(cfg: dict) -> dict:
+    """Merge env-var overrides into a loaded config dict."""
+    downstream = cfg.get("downstream") or []
+    env_ds = _env_downstream()
+    if env_ds:
+        # name-keyed merge: env entry replaces a same-named yaml entry, else appends
+        by_name = {d["name"]: d for d in downstream}
+        for d in env_ds:
+            by_name[d["name"]] = d
+        cfg["downstream"] = list(by_name.values())
+
+    emb = cfg.setdefault("embeddings", {})
+    for key, field in (("OLLAMA_URL", "ollama_url"), ("EMBED_MODEL", "model")):
+        val = os.environ.get(f"MCP_SIEVE_{key}")
+        if val:
+            emb[field] = val
+    if os.environ.get("MCP_SIEVE_TOP_N"):
+        emb["top_n"] = int(os.environ["MCP_SIEVE_TOP_N"])
+    return cfg
+
+
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
-        log.warning("config.yaml not found (%s), using empty downstream", CONFIG_PATH)
-        return {"downstream": [], "embeddings": {}}
+        log.info("config.yaml not found (%s), relying on env vars", CONFIG_PATH)
+        return _apply_env({"downstream": [], "embeddings": {}})
     log.info("loading config: %s", CONFIG_PATH)
-    return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    return _apply_env(cfg)
 
 
 CFG = load_config()
@@ -150,56 +200,94 @@ async def _invoke(entry: RegisteredTool, args: dict) -> list[TextContent]:
 
 # --- Downstream discovery ----------------------------------------------------
 
-async def discover_downstream_tools(exit_stack: contextlib.AsyncExitStack) -> None:
-    """Connect to all downstream MCP servers, pull tools, build embeddings.
+async def _open_transport(ds: dict, exit_stack: contextlib.AsyncExitStack):
+    """Open the right transport for a downstream and return (read, write).
 
-    ponytail: all stdio connections stay open via exit_stack for the whole lifetime.
+    ponytail: transport defaults to stdio; a bare `url` implies http.
     """
-    for ds in DOWNSTREAM:
-        name = ds["name"]
-        try:
-            params = StdioServerParameters(
-                command=ds["command"],
-                args=ds.get("args", []),
-                env=None,
-            )
-            log.info("connecting downstream %s: %s %s", name, params.command, params.args)
-            read, write = await exit_stack.enter_async_context(stdio_client(params))
-            session = await exit_stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
-            downstream_sessions[name] = session
-            log.info("downstream %s connected", name)
-        except Exception as e:
-            log.error("failed to connect downstream %s: %s", name, e)
-            continue
+    name = ds["name"]
+    transport = ds.get("transport") or ("http" if ds.get("url") else "stdio")
+    if transport == "stdio":
+        params = StdioServerParameters(command=ds["command"], args=ds.get("args", []), env=None)
+        log.info("connecting downstream %s (stdio): %s %s", name, params.command, params.args)
+        streams = await exit_stack.enter_async_context(stdio_client(params))
+    elif transport in ("http", "streamable-http"):
+        log.info("connecting downstream %s (http): %s", name, ds["url"])
+        streams = await exit_stack.enter_async_context(streamablehttp_client(ds["url"]))
+    elif transport == "sse":
+        log.info("connecting downstream %s (sse): %s", name, ds["url"])
+        streams = await exit_stack.enter_async_context(sse_client(ds["url"]))
+    else:
+        raise ValueError(f"unknown transport '{transport}' for downstream {name}")
+    return streams[0], streams[1]  # streamablehttp yields a 3rd session-id getter, ignore it
 
-    # Pull tools and build embeddings
-    for name, session in downstream_sessions.items():
-        try:
-            result = await session.list_tools()
-            for tool in result.tools:
-                ns_name = f"{name}_{tool.name}"
-                ns_tool = Tool(
-                    name=ns_name,
-                    description=tool.description,
-                    inputSchema=tool.inputSchema,
-                )
-                tool_registry[ns_name] = RegisteredTool(name, tool.name, ns_tool)
-        except Exception as e:
-            log.error("failed to list tools from downstream %s: %s", name, e)
 
-    if not tool_registry:
-        log.warning("no downstream tools registered")
+async def _connect(ds: dict, exit_stack: contextlib.AsyncExitStack) -> ClientSession:
+    """Open transport + ClientSession + initialize. Shared by discovery and reconnect."""
+    read, write = await _open_transport(ds, exit_stack)
+    session = await exit_stack.enter_async_context(ClientSession(read, write))
+    await session.initialize()
+    return session
+
+
+async def _register_tools(name: str, session: ClientSession) -> None:
+    """Pull tools + build embeddings for one downstream. Idempotent across reconnects.
+
+    ponytail: a server's tool set is stable — register once, skip on reconnect.
+    """
+    if any(e.downstream == name for e in tool_registry.values()):
+        return  # already registered on a previous connect
+    try:
+        result = await session.list_tools()
+    except Exception as e:
+        log.error("failed to list tools from downstream %s: %s", name, e)
         return
-
+    for tool in result.tools:
+        ns_name = f"{name}_{tool.name}"
+        ns_tool = Tool(name=ns_name, description=tool.description, inputSchema=tool.inputSchema)
+        tool_registry[ns_name] = RegisteredTool(name, tool.name, ns_tool)
     try:
         for ns_name, entry in list(tool_registry.items()):
-            text = f"{entry.tool.name}: {entry.tool.description or ''}"
-            embeddings_cache[ns_name] = await embed(text)
-        log.info("embeddings ready: %d tools", len(embeddings_cache))
+            if entry.downstream == name and ns_name not in embeddings_cache:
+                embeddings_cache[ns_name] = await embed(f"{entry.tool.name}: {entry.tool.description or ''}")
+        log.info("embeddings ready for %s (%d total)", name, len(embeddings_cache))
     except Exception as e:
-        log.warning("embeddings failed (%s), running without semantic search", e)
-        embeddings_cache.clear()
+        log.warning("embeddings failed for %s (%s), semantic search degraded", name, e)
+
+
+# ponytail: fixed backoff cap; make configurable if flapping servers appear.
+RECONNECT_BASE, RECONNECT_CAP, HEALTH_INTERVAL, STARTUP_TIMEOUT = 1.0, 30.0, 15.0, 60.0
+
+
+async def _supervise(ds: dict, ready: asyncio.Event) -> None:
+    """Keep one downstream connected; reconnect with exponential backoff on failure.
+
+    ponytail: each supervisor owns its exit_stack so connect/teardown run in the
+    same task — sidesteps anyio 'cancel scope in a different task'. Liveness via
+    periodic send_ping; a raised ping means the transport died.
+    """
+    name = ds["name"]
+    backoff = RECONNECT_BASE
+    while True:
+        try:
+            async with contextlib.AsyncExitStack() as stack:
+                session = await _connect(ds, stack)
+                downstream_sessions[name] = session
+                backoff = RECONNECT_BASE
+                log.info("downstream %s connected", name)
+                await _register_tools(name, session)
+                ready.set()
+                while True:
+                    await asyncio.sleep(HEALTH_INTERVAL)
+                    await session.send_ping()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            downstream_sessions.pop(name, None)
+            ready.set()  # don't hold up startup on a server that won't connect
+            log.warning("downstream %s down (%s); reconnecting in %.0fs", name, e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, RECONNECT_CAP)
 
 
 # --- MCP Server --------------------------------------------------------------
@@ -358,17 +446,32 @@ def _set_current_tools(tools: list[Tool]) -> None:
 async def main_async() -> None:
     _set_current_tools([])
 
-    async with contextlib.AsyncExitStack() as exit_stack:
-        await discover_downstream_tools(exit_stack)
+    ready = [asyncio.Event() for _ in DOWNSTREAM]
+    supervisors = [
+        asyncio.create_task(_supervise(ds, ev), name=f"supervise-{ds['name']}")
+        for ds, ev in zip(DOWNSTREAM, ready)
+    ]
+    # Wait for the first connect attempt of each downstream so tools/list isn't
+    # empty on the first select — bounded so one slow server can't stall startup.
+    if ready:
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                asyncio.gather(*(e.wait() for e in ready)), timeout=STARTUP_TIMEOUT
+            )
 
-        log.info("starting mcp-sieve on stdio, %d downstream connected, %d tools registered",
-                 len(downstream_sessions), len(tool_registry))
+    log.info("starting mcp-sieve on stdio, %d downstream connected, %d tools registered",
+             len(downstream_sessions), len(tool_registry))
+    try:
         async with stdio_server() as (read, write):
             await server.run(
                 read,
                 write,
                 server.create_initialization_options(NotificationOptions(tools_changed=True)),
             )
+    finally:
+        for t in supervisors:
+            t.cancel()
+        await asyncio.gather(*supervisors, return_exceptions=True)
 
 
 def main() -> None:

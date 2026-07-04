@@ -105,6 +105,12 @@ downstream:
     command: cmd
     args: ["/c", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
 
+  # Remote MCP over HTTP (streamable) or SSE — no local process.
+  # transport defaults to stdio; a bare url implies http.
+  - name: gitmcp
+    transport: http
+    url: "https://gitmcp.io/docs"
+
 embeddings:
   ollama_url: "http://127.0.0.1:11434/api/embeddings"
   model: "nomic-embed-text"
@@ -113,6 +119,10 @@ embeddings:
 
 Env variables:
 - `MCP_ROUTER_CONFIG` — path to `config.yaml` (otherwise looks in CWD or next to source)
+- `MCP_SIEVE_DOWNSTREAM_<N>_NAME` / `_COMMAND` / `_ARGS` / `_URL` / `_TRANSPORT` — define downstream servers without a file (Docker/k8s). `N` starts at 1, stops at the first gap. `_ARGS` is a JSON array or whitespace-split. A same-named entry overrides the yaml one.
+- `MCP_SIEVE_OLLAMA_URL` / `MCP_SIEVE_EMBED_MODEL` / `MCP_SIEVE_TOP_N` — embeddings overrides
+
+Crashed downstream servers (Ollama, npx) auto-reconnect with exponential backoff — no restart needed.
 
 ## Windows notes
 
@@ -130,7 +140,7 @@ Env variables:
 
 ## Stack
 
-- **MCP Python SDK** (`mcp`) — stdio transport, `notifications/tools/list_changed`
+- **MCP Python SDK** (`mcp`) — stdio + HTTP/SSE transports, `notifications/tools/list_changed`
 - **Ollama** — local embeddings (`nomic-embed-text`), free
 - **numpy** — cosine similarity
 - **httpx** — HTTP client for Ollama API
