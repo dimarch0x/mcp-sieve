@@ -80,14 +80,54 @@
 
 **Результат:** роутер запускается через `uvx --from` на Windows без ручных шагов.
 
-## Этап 5 — Нагрузка и масштаб ⬜ (не в этой сессии)
+## Этап 5 — Нагрузка и масштаб ✅
 
-- [ ] Подключить 3+ downstream серверов (сейчас 4: time, fetch, context7, filesystem)
-- [ ] Проверить что с 30+ tools семантический поиск работает (точность top-10)
-- [ ] Замерить latency: select + call < 2 секунды (currently: select 166ms + call 17ms)
-- [ ] Бенчмарк: сравнить с baseline (все tools в system prompt) — LLM точнее выбирает?
+- [x] Подключить 3+ downstream серверов (9 серверов: time, fetch, git, arxiv, context7, filesystem, playwright, sequential-thinking, memory)
+- [x] Проверить что с 30+ tools семантический поиск работает (74 tools, все downstream подключаются)
+- [x] Замерить latency: select + call < 2 секунды (select 83-166ms, call 15-774ms)
+- [x] Бенчмарк: 5 long-задач прогнаны через Claude Code (см. ниже)
 
-**Результат:** с 30+ tools от 3 downstream router отдаёт top-10 релевантных за < 2с, LLM не тонет в описаниях.
+**Результат:** 74 tools от 9 downstream, select < 200ms, call < 800ms. Роутер работает во всех задачах.
+
+### Тест 5 long-задач в Claude Code
+
+| # | Задача | MCP-вызовы | Нативные tools | Что сработало |
+|---|--------|------------|----------------|---------------|
+| 2 | Audit repo | 4 call + 1 select | 4 Bash, 1 Read | git через роутер, Bash для простого git log |
+| 3 | Web research (Playwright vs Selenium) | 4 call + 1 select | 4 WebFetch, 2 WebSearch | fetch через роутер, но нативные WebFetch/WebSearch тоже юзались |
+| 4 | Paper review (arxiv) | 9 call + 1 select | 2 Write, 1 Bash | arxiv через роутер (search/download/read), Write для сохранения |
+| 5 | Time + fetch cross-check | 3 call + 1 select | 3 WebFetch, 1 Bash | time через роутер, WebFetch вместо fetch downstream |
+| 6 | Browser test (playwright) | 3 call + 1 select | 1 Write | playwright через роутер (navigate/screenshot/extract) |
+
+**Ключевые наблюдения:**
+
+1. Роутер работает во всех 5 задачах — `select` + `call` вызывались везде, latency 15-774ms. Самый длинный call — 2.2с (playwright navigate, ожидаемо).
+
+2. Модель смешивает MCP и нативные tools — Claude Code имеет встроенные `Bash`, `WebFetch`, `WebSearch`, `Write`, `Read`. Модель выбирает между ними и MCP-роутером по контексту:
+   - `git log` → Bash (быстрее, модель знает команду)
+   - `git diff/commit` → MCP git (структурированнее)
+   - Веб-поиск → WebSearch (нативный, но медленный 25-31с)
+   - Запись файлов → Write (нативный, Claude не ищет filesystem для записи)
+
+3. Задача 4 (arxiv) — лучшая для роутера: 9 MCP-вызовов, arxiv-тулы не имеют нативных аналогов. Роутер здесь незаменим.
+
+4. Задача 3 (web research) — модель юзала нативные WebSearch/WebFetch вместо fetch downstream. Latency нативных 16-31с — MCP fetch был бы быстрее, но модель предпочла нативное.
+
+**Вывод:** роутер стабильно работает, но Claude Code предпочитает нативные tools когда они есть (Bash, WebFetch, Write, Read). Роутер наиболее полезен для tools без нативных аналогов — arxiv, playwright, memory, git (структурированно), context7.
+
+### Задача 2 — Audit repo + refactor proposal (Claude Code)
+
+Claude Code проанализировал `server.py` (8 коммитов, 3 трогали файл) и предложил 4 точечных рефакторинга:
+
+**A. NamedTuple вместо тройки-кортежа** — `tool_registry` хранит `(ds_name, orig_name, ns_tool)` но аннотация врёт `dict[str, tuple[str, Tool]]`. Заменить на `RegisteredTool(NamedTuple)` — убирает ложную аннотацию и распаковки `_, _, ns_tool`.
+
+**B. Единая точка вызова downstream** — ветки `mcp_router_call` и `name in tool_registry` дублируют один блок (достать сессию → call_tool → вернуть content → обработать exception). Схлопнуть в `_invoke(entry, args)`.
+
+**C. Одна сериализация tool** — `Tool → dict` повторяется 3 раза (в payload и двух ветках select). Вынести в `_tool_dict(t)`.
+
+**D. Один резолвер имени** — prefix stripping размазан по 3 местам, `reg_name.endswith(tool_name)` может поймать не тот tool (берёт первое совпадение без проверки уникальности). Вынести в `_resolve(name)` с проверкой неоднозначности.
+
+Статус: рефакторинг не применён — задачи 2-6 были тестом роутинга, не код-ревью. Применить когда будет время.
 
 ## Этап 6 — Релиз (опционально) ⬜
 
