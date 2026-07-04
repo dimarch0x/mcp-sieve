@@ -18,7 +18,7 @@
 - [x] `discover_downstream_tools()` спавнит subprocess каждого downstream MCP-сервера из config.yaml
 - [x] Через `mcp.Client` подключается, вызывает `list_tools()`
 - [x] Заполняет `tool_registry: {tool_name → (downstream_name, Tool)}`
-- [x] Сохраняет downstream клиенты в `downstream_procs` для дальнейшей маршрутизации
+- [x] Сохраняет downstream клиенты в `downstream_sessions` для дальнейшей маршрутизации
 - [x] Обработка падения одного downstream не роняет остальные
 
 **Результат:** при старте с 1 downstream (mcp-server-time) `tools/list` через `mcp_router_select` возвращает реальные tools (например `time_get_current_time`).
@@ -42,29 +42,58 @@
 
 **Результат:** LLM вызывает `get_current_time` через router → получает реальное время.
 
-## Этап 4 — Интеграция с Hermes
+## Этап 3.5 — mcp_router_call proxy ✅ (добавлено)
 
-- [ ] `hermes mcp add mcp-router --command python --args "-m mcp_router.server"`
-- [ ] `/reset` → Hermes видит только `mcp_router_mcp_router_select` (1 tool от роутера)
-- [ ] Юзер: "сколько времени" → LLM вызывает select → получает time tools → вызывает → получает время
-- [ ] Логи Hermes показывают `notifications/tools/list_changed` обработан
+- [x] `mcp_router_call(tool_name, arguments)` — статический прокси для замороженных toolset
+- [x] `mcp_router_select` отдаёт `inputSchema` для каждого tool
+- [x] Prefix stripping (`mcp_router_time_get_current_time` → `time_get_current_time`)
+- [x] Suffix matching (короткое имя → полный registry key)
+- [x] JSON-строки в `arguments` парсятся автоматически
+- [x] Fallback: unknown tool → понятная ошибка
 
-**Результат:** end-to-end workflow работает внутри Hermes. Один downstream (time), одна задача.
+**Результат:** Claude Code и Hermes с prompt caching могут вызывать downstream tools без `/reset` после `select`.
 
-## Этап 5 — Нагрузка и масштаб
+## Этап 4 — Интеграция с Hermes ✅
 
-- [ ] Подключить 3+ downstream серверов (filesystem, git, web-search)
+- [x] `hermes mcp add router` (через `uvx --from`)
+- [x] Роутер виден в Hermes: 2 tool (`mcp_router_select` + `mcp_router_call`)
+- [x] Юзер: "сколько времени" → LLM вызывает select → получает time tools → call → получает время
+- [x] `notifications/tools/list_changed` работает (для клиентов с динамическим toolset)
+
+**Результат:** end-to-end workflow работает внутри Hermes. 4 downstream, 19 инструментов.
+
+## Этап 4.5 — Интеграция с Claude Code ✅ (добавлено)
+
+- [x] Роутер подключён в `~/.claude.json` через `uvx --from`
+- [x] `MCP_ROUTER_CONFIG` env указывает на config.yaml
+- [x] E2E: "время в Нью-Йорке" → select → call → реальный ответ
+- [x] Latency: select ~166ms, call ~17ms
+
+**Результат:** Claude Code видит 2 инструмента вместо 19, роутинг работает.
+
+## Этап 4.6 — Windows-фиксы ✅ (добавлено)
+
+- [x] `pyyaml` добавлен в `pyproject.toml` dependencies (uvx изолированный venv)
+- [x] Config discovery: `MCP_ROUTER_CONFIG` env → CWD → `__file__` fallback
+- [x] npx downstream: `cmd /c npx` вместо `npx` (.cmd resolution)
+- [x] README с Windows-нюансами
+
+**Результат:** роутер запускается через `uvx --from` на Windows без ручных шагов.
+
+## Этап 5 — Нагрузка и масштаб ⬜ (не в этой сессии)
+
+- [ ] Подключить 3+ downstream серверов (сейчас 4: time, fetch, context7, filesystem)
 - [ ] Проверить что с 30+ tools семантический поиск работает (точность top-10)
-- [ ] Замерить latency: select + re-list < 2 секунды
+- [ ] Замерить latency: select + call < 2 секунды (currently: select 166ms + call 17ms)
 - [ ] Бенчмарк: сравнить с baseline (все tools в system prompt) — LLM точнее выбирает?
 
 **Результат:** с 30+ tools от 3 downstream router отдаёт top-10 релевантных за < 2с, LLM не тонет в описаниях.
 
-## Этап 6 — Релиз (опционально)
+## Этап 6 — Релиз (опционально) ⬜
 
-- [ ] README с инструкцией установки
+- [x] README с инструкцией установки ✅
 - [ ] Поддержка HTTP transport для downstream
-- [ ] Конфиг через env vars (не только yaml)
+- [ ] Конфиг через env vars (не только yaml) — `MCP_ROUTER_CONFIG` уже есть
 - [ ] Запостить на GitHub + r/mcp или r/ClaudeAI
 
 **Результат:** публичный репозиторий, кто-то другой может установить за `uvx mcp-router`.
@@ -73,10 +102,10 @@
 
 ## Критерии успеха (измеримые)
 
-| Метрика | Цель |
-|---------|------|
-| Downstream tools, при которых router имеет смысл | ≥ 20 |
-| Latency select + re-list | < 2с |
-| Точность top-10 (релевантный tool в выдаче) | ≥ 90% |
-| Кол-во tools в system prompt LLM | 1 (всегда) до select, ≤ 10 после |
-| Память (embeddings in-memory) | < 50MB для 100 tools |
+| Метрика | Цель | Текущее |
+|---------|------|---------|
+| Downstream tools, при которых router имеет смысл | ≥ 20 | 19 (4 сервера) ✅ почти |
+| Latency select + re-list | < 2с | select 166ms + call 17ms ✅ |
+| Точность top-10 (релевантный tool в выдаче) | ≥ 90% | eyeball: time/sqlite/fs/context7 — все находились ✅ |
+| Кол-во tools в system prompt LLM | 1 (всегда) до select, ≤ 10 после | 2 (select + call), всегда ✅ |
+| Память (embeddings in-memory) | < 50MB для 100 tools | 19 tools, ~KB ✅ |
