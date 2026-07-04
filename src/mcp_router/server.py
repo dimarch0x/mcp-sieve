@@ -12,7 +12,7 @@
   1. LLM вызывает mcp_router_select(task="...") → получает список подходящих инструментов с их inputSchema.
   2. LLM вызывает mcp_router_call(tool_name="...", arguments={...}) для выполнения выбранного инструмента.
 
-ponytail: один файл, всё в нём. Refactor когда стабильно.
+ponytail: один файл, всё в нём.
 """
 import asyncio
 import contextlib
@@ -20,6 +20,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import NamedTuple
 
 import httpx
 import numpy as np
@@ -70,9 +71,16 @@ DOWNSTREAM = CFG.get("downstream", [])
 
 # --- State -------------------------------------------------------------------
 
-# tool_name → (downstream_name, Tool)
-tool_registry: dict[str, tuple[str, Tool]] = {}
-# tool_name → embedding vector (np.ndarray)
+
+class RegisteredTool(NamedTuple):
+    downstream: str
+    orig_name: str
+    tool: Tool
+
+
+# ns_name → RegisteredTool
+tool_registry: dict[str, RegisteredTool] = {}
+# ns_name → embedding vector (np.ndarray)
 embeddings_cache: dict[str, np.ndarray] = {}
 # downstream_name → ClientSession
 downstream_sessions: dict[str, ClientSession] = {}
@@ -97,6 +105,47 @@ async def embed(text: str) -> np.ndarray:
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     # ponytail: numpy — до 1000 tools scan норм; больше — FAISS.
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+
+
+# --- Helpers -----------------------------------------------------------------
+
+
+def _text(text: str) -> list[TextContent]:
+    return [TextContent(type="text", text=text)]
+
+
+def _tool_dict(t: Tool) -> dict:
+    """Одна точка сериализации Tool → dict для select-ответов."""
+    return {"name": t.name, "description": t.description, "inputSchema": t.inputSchema}
+
+
+def _resolve(name: str) -> str | None:
+    """Резолвим имя tool: exact → strip mcp_router_ prefix → unique suffix match.
+
+    ponytail: suffix match с проверкой уникальности — не молча берём первое.
+    'time' совпадёт с '..._get_time', но если совпадений >1 → None (неоднозначность).
+    """
+    if name in tool_registry:
+        return name
+    if name.startswith("mcp_router_"):
+        stripped = name[len("mcp_router_"):]
+        if stripped in tool_registry:
+            return stripped
+    matches = [n for n in tool_registry if n.endswith(f"_{name}")]
+    return matches[0] if len(matches) == 1 else None
+
+
+async def _invoke(entry: RegisteredTool, args: dict) -> list[TextContent]:
+    """Единая точка вызова downstream-сессии."""
+    session = downstream_sessions.get(entry.downstream)
+    if session is None:
+        return _text(f"downstream session {entry.downstream} not available")
+    try:
+        result: CallToolResult = await session.call_tool(entry.orig_name, args)
+        return result.content
+    except Exception as e:
+        log.exception("downstream call failed: %s/%s", entry.downstream, entry.orig_name)
+        return _text(json.dumps({"error": f"downstream call failed: {e}"}, ensure_ascii=False))
 
 
 # --- Downstream discovery ----------------------------------------------------
@@ -135,7 +184,7 @@ async def discover_downstream_tools(exit_stack: contextlib.AsyncExitStack) -> No
                     description=tool.description,
                     inputSchema=tool.inputSchema,
                 )
-                tool_registry[ns_name] = (name, tool.name, ns_tool)
+                tool_registry[ns_name] = RegisteredTool(name, tool.name, ns_tool)
         except Exception as e:
             log.error("failed to list tools from downstream %s: %s", name, e)
 
@@ -144,8 +193,8 @@ async def discover_downstream_tools(exit_stack: contextlib.AsyncExitStack) -> No
         return
 
     try:
-        for ns_name, (ds_name, orig_name, ns_tool) in list(tool_registry.items()):
-            text = f"{ns_tool.name}: {ns_tool.description or ''}"
+        for ns_name, entry in list(tool_registry.items()):
+            text = f"{entry.tool.name}: {entry.tool.description or ''}"
             embeddings_cache[ns_name] = await embed(text)
         log.info("embeddings ready: %d tools", len(embeddings_cache))
     except Exception as e:
@@ -236,49 +285,17 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent] | li
         if not tool_name:
             return _text(json.dumps({"error": "tool_name is required"}, ensure_ascii=False))
 
-        # Стрипаем префикс mcp_router_ если модель передала его в имени целевого инструмента
-        if tool_name.startswith("mcp_router_"):
-            tool_name = tool_name[len("mcp_router_"):]
+        resolved = _resolve(tool_name)
+        if resolved is None:
+            return _text(json.dumps({"error": f"unknown tool: {tool_name}"}, ensure_ascii=False))
+        return await _invoke(tool_registry[resolved], tool_args)
 
-        if tool_name not in tool_registry:
-            # Пробуем найти без префиксов вообще (например, если модель передала 'time_get_current_time' вместо 'mcp-server-time_time_get_current_time')
-            found = False
-            for reg_name in tool_registry:
-                if reg_name.endswith(tool_name):
-                    tool_name = reg_name
-                    found = True
-                    break
-            if not found:
-                return _text(json.dumps({"error": f"unknown tool: {tool_name}"}, ensure_ascii=False))
-
-        ds_name, orig_name, ns_tool = tool_registry[tool_name]
-        session = downstream_sessions.get(ds_name)
-        if session is None:
-            return _text(f"downstream session {ds_name} not available")
-        try:
-            result: CallToolResult = await session.call_tool(orig_name, tool_args)
-            return result.content
-        except Exception as e:
-            log.exception("downstream call failed: %s/%s", ds_name, orig_name)
-            return _text(json.dumps({"error": f"downstream call failed: {e}"}, ensure_ascii=False))
-
-    if name in tool_registry:
-        ds_name, orig_name, ns_tool = tool_registry[name]
-        session = downstream_sessions.get(ds_name)
-        if session is None:
-            return _text(f"downstream session {ds_name} not available")
-        try:
-            result: CallToolResult = await session.call_tool(orig_name, args)
-            return result.content
-        except Exception as e:
-            log.exception("downstream call failed: %s/%s", ds_name, orig_name)
-            return _text(json.dumps({"error": f"downstream call failed: {e}"}, ensure_ascii=False))
+    # Прямой вызов downstream tool по registry name
+    resolved = _resolve(name)
+    if resolved is not None:
+        return await _invoke(tool_registry[resolved], args)
 
     return _text(json.dumps({"error": f"unknown tool: {name}"}, ensure_ascii=False))
-
-
-def _text(text: str) -> list[TextContent]:
-    return [TextContent(type="text", text=text)]
 
 
 async def _handle_select(task: str) -> list[TextContent]:
@@ -294,28 +311,22 @@ async def _handle_select(task: str) -> list[TextContent]:
 
     if not embeddings_cache:
         # нет embeddings — отдаём все tools, не ломая flow
-        all_ns_tools = [ns_tool for _, _, ns_tool in tool_registry.values()]
+        all_ns_tools = [entry.tool for entry in tool_registry.values()]
         _set_current_tools(all_ns_tools)
         return _text(json.dumps({
             "warning": "embeddings unavailable; returning all tools",
-            "tools": [
-                {
-                    "name": t.name,
-                    "description": t.description,
-                    "inputSchema": t.inputSchema
-                } for t in all_ns_tools
-            ],
+            "tools": [_tool_dict(t) for t in all_ns_tools],
             "hint": "Use mcp_router_call(tool_name=<name>, arguments=<args>) to execute any of these tools.",
         }, ensure_ascii=False))
 
     q_vec = await embed(task)
-    scored: list[tuple[float, str, Tool]] = []
+    scored: list[tuple[float, Tool]] = []
     for ns_name, vec in embeddings_cache.items():
-        ds_name, orig_name, ns_tool = tool_registry[ns_name]
-        scored.append((cosine_sim(q_vec, vec), ds_name, ns_tool))
+        entry = tool_registry[ns_name]
+        scored.append((cosine_sim(q_vec, vec), entry.tool))
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    top = [t for _, _, t in scored[:TOP_N]]
+    top = [t for _, t in scored[:TOP_N]]
     _set_current_tools(top)
 
     # уведомляем клиента (best-effort, работает только внутри request context)
@@ -329,13 +340,7 @@ async def _handle_select(task: str) -> list[TextContent]:
         log.warning("could not send list_changed: %s", e)
 
     payload = {
-        "selected_tools": [
-            {
-                "name": t.name,
-                "description": t.description,
-                "inputSchema": t.inputSchema
-            } for t in top
-        ],
+        "selected_tools": [_tool_dict(t) for t in top],
         "hint": "Use mcp_router_call(tool_name=<name>, arguments=<args>) to execute any of these tools.",
     }
     return _text(json.dumps(payload, ensure_ascii=False))
