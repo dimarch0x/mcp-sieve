@@ -1,13 +1,30 @@
 # MCP Router configuration
 # Downstream MCP-серверы, которые роутер будет агрегировать.
-# Убери/добавь под себя. Для старта — один пример (time server).
 downstream:
   - name: time
     command: uvx
     args: ["mcp-server-time"]
 
+  - name: fetch
+    command: uvx
+    args: ["mcp-server-fetch"]
+
+  - name: sqlite
+    command: uvx
+    args: ["mcp-server-sqlite", "--db-path", "C:\\Users\\manda\\Projects\\mcp-router\\test.db"]
+
+  # ponytail: Windows — npx это .cmd, MCP SDK юзает create_subprocess_exec без shell.
+  # Поэтому cmd /c npx вместо просто npx.
+  - name: context7
+    command: cmd
+    args: ["/c", "npx", "-y", "@upstash/context7-mcp@latest"]
+
+  - name: filesystem
+    command: cmd
+    args: ["/c", "npx", "-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\manda\\Projects\\mcp-router"]
+
 # Настройки embeddings (Ollama)
 embeddings:
   ollama_url: "http://127.0.0.1:11434/api/embeddings"
-  model: "nomic-embed-text"  # маленькая, быстрая; установи: ollama pull nomic-embed-text
-  top_n: 10  # сколько релевантных tools отдавать LLM
+  model: "nomic-embed-text"
+  top_n: 10
