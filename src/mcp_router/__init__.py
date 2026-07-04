@@ -1,1 +1,1 @@
-"""MCP Router package."""
+"""MCP Sieve package."""

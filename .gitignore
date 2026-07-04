@@ -8,3 +8,6 @@ build/
 .pytest_cache/
 .env
 *.log
+
+# Real config with local paths — use config.example.yaml as template
+config.yaml

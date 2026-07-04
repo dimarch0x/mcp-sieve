@@ -1,80 +1,86 @@
-# MCP Router
+# MCP Sieve
 
-Семантический прокси для MCP-серверов. Решает проблему **tool selection degradation** — когда у LLM слишком много инструментов, она хуже выбирает нужный.
+A semantic proxy for MCP servers. Solves **tool selection degradation** — when an LLM has too many tools, it picks the wrong ones.
 
-Роутер стоит между клиентом (Claude Code, Hermes, любой MCP-клиент) и downstream MCP-серверами. Клиент видит **2 инструмента** вместо десятков: `mcp_router_select` + `mcp_router_call`. Первый находит релевантные tools через embeddings, второй проксирует вызов.
+The sieve sits between the client (Claude Code, Hermes, any MCP client) and downstream MCP servers. The client sees **2 tools** instead of dozens: `mcp_router_select` + `mcp_router_call`. The first finds relevant tools via embeddings, the second proxies the call.
 
-## Как работает
+## How it works
 
 ```
-Клиент (Claude Code / Hermes)
-  ↓ видит только 2 инструмента
-mcp_router_select(task="...")  →  embeddings → top-N релевантных tools
-mcp_router_call(tool_name, arguments)  →  проксирует на downstream
+Client (Claude Code / Hermes)
+  ↓ sees only 2 tools
+mcp_router_select(task="...")  →  embeddings → top-N relevant tools
+mcp_router_call(tool_name, arguments)  →  proxies to downstream
   ↓
-downstream MCP-серверы (time, fetch, context7, filesystem, ...)
+downstream MCP servers (time, fetch, git, arxiv, playwright, ...)
 ```
 
-**Два пути вызова:**
+**Two call paths:**
 
-1. **Путь 1 (notifications/tools/list_changed):** `select` находит tools → роутер обновляет `tools/list` → клиент вызывает tools напрямую. Работает с клиентами, поддерживающими динамическое обновление toolset.
+1. **Path 1 (notifications/tools/list_changed):** `select` finds tools → sieve updates `tools/list` → client calls tools directly. Works with clients that support dynamic toolset updates.
 
-2. **Путь 2 (mcp_router_call proxy):** для клиентов с **замороженным toolset** (Hermes, Claude Code с prompt caching). `select` отдаёт tools с `inputSchema` → `call` проксирует выполнение. Не требует `/reset` при обнаружении новых downstream-тулов.
+2. **Path 2 (mcp_router_call proxy):** for clients with a **frozen toolset** (Hermes, Claude Code with prompt caching). `select` returns tools with `inputSchema` → `call` proxies execution. No `/reset` needed when new downstream tools are discovered.
 
-## Установка
+## Install
 
 ```bash
-git clone <repo> ~/Projects/mcp-router
-cd ~/Projects/mcp-router
+git clone <repo> ~/Projects/mcp-sieve
+cd ~/Projects/mcp-sieve
 uv pip install -e .
 ```
 
-Нужен [Ollama](https://ollama.com) с embed-моделью:
+Requires [Ollama](https://ollama.com) with an embed model:
 ```bash
 ollama pull nomic-embed-text
 ```
 
-## Запуск (standalone)
+## Quick start
 
+Copy the example config and edit it:
+```bash
+cp config.example.yaml config.yaml
+# edit config.yaml — add your downstream servers and paths
+```
+
+Run standalone:
 ```bash
 python -m mcp_router.server
 ```
+Server listens on stdio (JSON-RPC).
 
-Сервер слушает stdio (JSON-RPC).
+## Connect to Claude Code
 
-## Подключение к Claude Code
-
-В `~/.claude.json` → `projects["<path>"].mcpServers`:
+In `~/.claude.json` → `projects["<path>"].mcpServers`:
 
 ```json
-"router": {
+"sieve": {
   "type": "stdio",
   "command": "uvx",
-  "args": ["--from", "C:\\Users\\<user>\\Projects\\mcp-router", "mcp-router"],
+  "args": ["--from", "/path/to/mcp-sieve", "mcp-sieve"],
   "env": {
-    "MCP_ROUTER_CONFIG": "C:\\Users\\<user>\\Projects\\mcp-router\\config.yaml"
+    "MCP_ROUTER_CONFIG": "/path/to/mcp-sieve/config.yaml"
   }
 }
 ```
 
-Или через CLI:
+Or via CLI:
 ```bash
-claude mcp add router -- uvx --from /path/to/mcp-router mcp-router
+claude mcp add sieve -- uvx --from /path/to/mcp-sieve mcp-sieve
 ```
 
-> **Windows:** `MCP_ROUTER_CONFIG` обязателен — `uvx` ставит пакет в изолированный venv, `__file__` указывает в uv-cache. См. [Windows-нюансы](#windows-нюансы).
+> **Windows:** `MCP_ROUTER_CONFIG` is required — `uvx` installs the package into an isolated venv, `__file__` points into uv-cache. See [Windows notes](#windows-notes) below.
 
-## Подключение к Hermes
+## Connect to Hermes
 
 ```bash
-hermes mcp add router --command uvx --args "--from" --args "/path/to/mcp-router" --args "mcp-router"
-hermes mcp test router
-# /reset в чате
+hermes mcp add sieve --command uvx --args "--from" --args "/path/to/mcp-sieve" --args "mcp-sieve"
+hermes mcp test sieve
+# /reset in chat
 ```
 
-## Конфиг
+## Config
 
-`config.yaml`:
+`config.yaml` (see `config.example.yaml` for a full template):
 
 ```yaml
 downstream:
@@ -86,7 +92,11 @@ downstream:
     command: uvx
     args: ["mcp-server-fetch"]
 
-  # Windows: npx это .cmd — нужен cmd /c
+  - name: git
+    command: uvx
+    args: ["mcp-server-git", "--repository", "/path/to/your/repo"]
+
+  # Windows: npx is a .cmd file — needs cmd /c
   - name: context7
     command: cmd
     args: ["/c", "npx", "-y", "@upstash/context7-mcp@latest"]
@@ -101,36 +111,41 @@ embeddings:
   top_n: 10
 ```
 
-Env-переменные:
-- `MCP_ROUTER_CONFIG` — путь к `config.yaml` (иначе ищет в CWD или рядом с исходником)
+Env variables:
+- `MCP_ROUTER_CONFIG` — path to `config.yaml` (otherwise looks in CWD or next to source)
 
-## Windows-нюансы
+## Windows notes
 
-1. **npx → `cmd /c npx`:** `npx` это `.cmd`-файл, Python subprocess (MCP SDK) не находит его без shell. `uvx` — настоящий бинарник, работает напрямую.
+1. **npx → `cmd /c npx`:** `npx` is a `.cmd` file, Python subprocess (MCP SDK) can't find it without a shell. `uvx` is a real binary, works directly.
 
-2. **uvx --from и dependencies:** `uvx --from <project>` ставит пакет в изолированный uv-cache venv. Все импорты должны быть в `pyproject.toml` `[project.dependencies]` — неявные deps из dev-окружения не подхватятся.
+2. **uvx --from and dependencies:** `uvx --from <project>` installs the package into an isolated uv-cache venv. All imports must be in `pyproject.toml` `[project.dependencies]` — implicit deps from the dev env won't be picked up.
 
-3. **uv cache clean:** если cache занят (`os error 32`), убить процессы MCP-серверов:
+3. **uv cache clean:** if the cache is locked (`os error 32`), kill MCP server processes first:
    ```bash
    powershell -Command "Get-Process | Where-Object { $_.ProcessName -match 'mcp|uv' } | Stop-Process -Force"
    uv cache clean --force
    ```
 
-4. **Дебаг подключения:** `claude --debug` пишет в `~/.claude/debug/<session>.txt`. Grep `Server stderr:` — реальные traceback'и сервера.
+4. **Debug connection failures:** `claude --debug` writes to `~/.claude/debug/<session>.txt`. Grep `Server stderr:` for real server tracebacks.
 
-## Стек
+## Stack
 
 - **MCP Python SDK** (`mcp`) — stdio transport, `notifications/tools/list_changed`
-- **Ollama** — локальные embeddings (`nomic-embed-text`), бесплатно
+- **Ollama** — local embeddings (`nomic-embed-text`), free
 - **numpy** — cosine similarity
-- **httpx** — HTTP-клиент для Ollama API
+- **httpx** — HTTP client for Ollama API
 
 ## Fallback
 
-Если Ollama недоступен — роутер не падает. `mcp_router_select` отдаёт **все** downstream tools без ранжирования, с warning в ответе.
+If Ollama is unavailable — the sieve doesn't crash. `mcp_router_select` returns **all** downstream tools without ranking, with a warning in the response.
 
-## Статус
+## Performance
 
-Этапы 0–4 завершены. Роутер работает end-to-end в Claude Code и Hermes: 4 downstream-сервера, 19 инструментов, семантический роутинг, `mcp_router_call` proxy.
+Tested with 9 downstream servers (74 tools):
+- `mcp_router_select`: 83–166ms
+- `mcp_router_call`: 15–774ms (longest: playwright browser navigation)
+- Startup: ~16s (all 9 downstream connect + 74 embeddings built)
 
-См. `TASKS.md` для roadmap (нагрузка, бенчмарк, релиз).
+## Status
+
+Working end-to-end in Claude Code and Hermes. See `TASKS.md` for the roadmap and benchmark results.

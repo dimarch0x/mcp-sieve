@@ -1,7 +1,7 @@
 [project]
-name = "mcp-router"
+name = "mcp-sieve"
 version = "0.1.0"
-description = "MCP Router/Proxy — semantic tool selection for LLMs"
+description = "MCP Sieve — semantic tool selection proxy for LLMs"
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.0.0",
@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mcp-router = "mcp_router.server:main"
+mcp-sieve = "mcp_router.server:main"
 
 [tool.uv]
 package = true

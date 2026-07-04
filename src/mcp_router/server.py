@@ -1,18 +1,18 @@
-"""MCP Router — semantic tool selection proxy.
+"""MCP Sieve — semantic tool selection proxy.
 
-Путь 1 (notifications/tools/list_changed):
-  1. tools/list отдаёт 1 tool: mcp_router_select
-  2. LLM вызывает mcp_router_select(task="...") → router ищет top-N tools
-  3. Router обновляет current_tools + посылает notifications/tools/list_changed
-  4. tools/list отдаёт уже релевантные tools
-  5. LLM вызывает tool напрямую → router проксирует на downstream
+Path 1 (notifications/tools/list_changed):
+  1. tools/list returns 1 tool: mcp_router_select
+  2. LLM calls mcp_router_select(task="...") → sieve finds top-N tools
+  3. Sieve updates current_tools + sends notifications/tools/list_changed
+  4. tools/list now returns the relevant tools
+  5. LLM calls a tool directly → sieve proxies to downstream
 
-Путь 2 (mcp_router_call):
-  Для клиентов с замороженным toolset (например, Hermes с prompt caching):
-  1. LLM вызывает mcp_router_select(task="...") → получает список подходящих инструментов с их inputSchema.
-  2. LLM вызывает mcp_router_call(tool_name="...", arguments={...}) для выполнения выбранного инструмента.
+Path 2 (mcp_router_call):
+  For clients with a frozen toolset (e.g. Hermes with prompt caching):
+  1. LLM calls mcp_router_select(task="...") → gets a list of suitable tools with their inputSchema.
+  2. LLM calls mcp_router_call(tool_name="...", arguments={...}) to execute the chosen tool.
 
-ponytail: один файл, всё в нём.
+ponytail: one file, everything in it.
 """
 import asyncio
 import contextlib
@@ -32,13 +32,13 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, EmbeddedResource, ImageContent, TextContent, Tool
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
-log = logging.getLogger("mcp-router")
+log = logging.getLogger("mcp-sieve")
 
 # --- Config ------------------------------------------------------------------
 
-# ponytail: при запуске через uvx --from <project> пакет стоит в uv-cache,
-# __file__ указывает туда. Ищем config.yaml: (1) env MCP_ROUTER_CONFIG,
-# (2) рядом с CWD, (3) fallback на старый путь relative-to-source.
+# ponytail: when launched via uvx --from <project>, the package lives in uv-cache,
+# __file__ points there. Look for config.yaml: (1) env MCP_ROUTER_CONFIG,
+# (2) next to CWD, (3) fallback to the old path relative to source.
 def _find_config() -> Path:
     env = os.environ.get("MCP_ROUTER_CONFIG")
     if env:
@@ -56,7 +56,7 @@ CONFIG_PATH = _find_config()
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
-        log.warning("config.yaml не найден (%s), использую пустой downstream", CONFIG_PATH)
+        log.warning("config.yaml not found (%s), using empty downstream", CONFIG_PATH)
         return {"downstream": [], "embeddings": {}}
     log.info("loading config: %s", CONFIG_PATH)
     return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -84,7 +84,7 @@ tool_registry: dict[str, RegisteredTool] = {}
 embeddings_cache: dict[str, np.ndarray] = {}
 # downstream_name → ClientSession
 downstream_sessions: dict[str, ClientSession] = {}
-# текущий список tools для tools/list
+# current tool list exposed via tools/list
 current_tools: list[Tool] = []
 
 # --- Embedding ---------------------------------------------------------------
@@ -93,7 +93,7 @@ _embed_client: httpx.AsyncClient | None = None
 
 
 async def embed(text: str) -> np.ndarray:
-    """Получить embedding текста через Ollama. ponytail: кэш в памяти, без БД."""
+    """Get text embedding via Ollama. ponytail: in-memory cache, no DB."""
     global _embed_client
     if _embed_client is None:
         _embed_client = httpx.AsyncClient(timeout=30)
@@ -103,7 +103,7 @@ async def embed(text: str) -> np.ndarray:
 
 
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    # ponytail: numpy — до 1000 tools scan норм; больше — FAISS.
+    # ponytail: numpy — fine up to 1000 tools; beyond that use FAISS.
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
 
 
@@ -115,15 +115,15 @@ def _text(text: str) -> list[TextContent]:
 
 
 def _tool_dict(t: Tool) -> dict:
-    """Одна точка сериализации Tool → dict для select-ответов."""
+    """Single serialization point for Tool → dict in select responses."""
     return {"name": t.name, "description": t.description, "inputSchema": t.inputSchema}
 
 
 def _resolve(name: str) -> str | None:
-    """Резолвим имя tool: exact → strip mcp_router_ prefix → unique suffix match.
+    """Resolve a tool name: exact → strip mcp_router_ prefix → unique suffix match.
 
-    ponytail: suffix match с проверкой уникальности — не молча берём первое.
-    'time' совпадёт с '..._get_time', но если совпадений >1 → None (неоднозначность).
+    ponytail: suffix match with uniqueness check — never silently picks the first.
+    'time' would match '..._get_time', but if >1 match → None (ambiguous).
     """
     if name in tool_registry:
         return name
@@ -136,7 +136,7 @@ def _resolve(name: str) -> str | None:
 
 
 async def _invoke(entry: RegisteredTool, args: dict) -> list[TextContent]:
-    """Единая точка вызова downstream-сессии."""
+    """Single point for calling a downstream session."""
     session = downstream_sessions.get(entry.downstream)
     if session is None:
         return _text(f"downstream session {entry.downstream} not available")
@@ -151,9 +151,9 @@ async def _invoke(entry: RegisteredTool, args: dict) -> list[TextContent]:
 # --- Downstream discovery ----------------------------------------------------
 
 async def discover_downstream_tools(exit_stack: contextlib.AsyncExitStack) -> None:
-    """Коннектится ко всем downstream MCP-серверам, тянет tools, строит embeddings.
+    """Connect to all downstream MCP servers, pull tools, build embeddings.
 
-    ponytail: все stdio-соединения держим открытыми через exit_stack на всё время работы.
+    ponytail: all stdio connections stay open via exit_stack for the whole lifetime.
     """
     for ds in DOWNSTREAM:
         name = ds["name"]
@@ -173,7 +173,7 @@ async def discover_downstream_tools(exit_stack: contextlib.AsyncExitStack) -> No
             log.error("failed to connect downstream %s: %s", name, e)
             continue
 
-    # Тянем tools и строим embeddings
+    # Pull tools and build embeddings
     for name, session in downstream_sessions.items():
         try:
             result = await session.list_tools()
@@ -204,7 +204,7 @@ async def discover_downstream_tools(exit_stack: contextlib.AsyncExitStack) -> No
 
 # --- MCP Server --------------------------------------------------------------
 
-server: Server = Server("mcp-router")
+server: Server = Server("mcp-sieve")
 
 ROUTER_SELECT_TOOL = Tool(
     name="mcp_router_select",
@@ -251,20 +251,20 @@ ROUTER_CALL_TOOL = Tool(
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    """Отдаём текущий список tools."""
+    """Return the current tool list."""
     return current_tools
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict | None) -> list[TextContent] | list[ImageContent] | list[EmbeddedResource]:
-    """Маршрутизация вызова tool.
+    """Tool call routing.
 
-    ponytail: Hermes может передать prefixed name (mcp_router_time_get_current_time).
-    Стрипаем mcp_router_ если после stripping имя матчится с registry или select.
+    ponytail: Hermes may pass a prefixed name (mcp_router_time_get_current_time).
+    Strip mcp_router_ if the stripped name matches the registry or select.
     """
     args = arguments or {}
 
-    # ponytail: insurance — если клиент передаёт prefixed name, стрипаем
+    # ponytail: insurance — if the client passes a prefixed name, strip it
     if name.startswith("mcp_router_"):
         stripped = name[len("mcp_router_"):]
         if stripped in ("mcp_router_select", "mcp_router_call") or stripped in tool_registry:
@@ -290,7 +290,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent] | li
             return _text(json.dumps({"error": f"unknown tool: {tool_name}"}, ensure_ascii=False))
         return await _invoke(tool_registry[resolved], tool_args)
 
-    # Прямой вызов downstream tool по registry name
+    # Direct downstream call by registry name
     resolved = _resolve(name)
     if resolved is not None:
         return await _invoke(tool_registry[resolved], args)
@@ -299,7 +299,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent] | li
 
 
 async def _handle_select(task: str) -> list[TextContent]:
-    """Ядро: семантический поиск tools по задаче."""
+    """Core: semantic search for tools matching the task."""
     if not task:
         return _text('{"error": "task is required"}')
 
@@ -310,7 +310,7 @@ async def _handle_select(task: str) -> list[TextContent]:
         }, ensure_ascii=False))
 
     if not embeddings_cache:
-        # нет embeddings — отдаём все tools, не ломая flow
+        # no embeddings — return all tools, don't break the flow
         all_ns_tools = [entry.tool for entry in tool_registry.values()]
         _set_current_tools(all_ns_tools)
         return _text(json.dumps({
@@ -329,7 +329,7 @@ async def _handle_select(task: str) -> list[TextContent]:
     top = [t for _, t in scored[:TOP_N]]
     _set_current_tools(top)
 
-    # уведомляем клиента (best-effort, работает только внутри request context)
+    # notify the client (best-effort, only works inside a request context)
     try:
         ctx = server.request_context
         await ctx.session.send_tool_list_changed()
@@ -347,7 +347,7 @@ async def _handle_select(task: str) -> list[TextContent]:
 
 
 def _set_current_tools(tools: list[Tool]) -> None:
-    """Обновить current_tools. Всегда держим mcp_router_select и mcp_router_call первыми."""
+    """Update current_tools. Always keep mcp_router_select and mcp_router_call first."""
     global current_tools
     others = [t for t in tools if t.name not in ("mcp_router_select", "mcp_router_call")]
     current_tools = [ROUTER_SELECT_TOOL, ROUTER_CALL_TOOL] + others
@@ -361,7 +361,7 @@ async def main_async() -> None:
     async with contextlib.AsyncExitStack() as exit_stack:
         await discover_downstream_tools(exit_stack)
 
-        log.info("starting mcp-router on stdio, %d downstream connected, %d tools registered",
+        log.info("starting mcp-sieve on stdio, %d downstream connected, %d tools registered",
                  len(downstream_sessions), len(tool_registry))
         async with stdio_server() as (read, write):
             await server.run(

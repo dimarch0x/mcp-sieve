@@ -1,5 +1,9 @@
-# MCP Router configuration
-# Downstream MCP-серверы, которые роутер будет агрегировать.
+# MCP Sieve configuration
+# Copy this file to config.yaml and edit for your setup.
+# Real config.yaml is gitignored — it contains your local paths.
+
+# Downstream MCP servers that the router will aggregate.
+# Each entry spawns a stdio MCP server process.
 downstream:
   - name: time
     command: uvx
@@ -11,21 +15,21 @@ downstream:
 
   - name: git
     command: uvx
-    args: ["mcp-server-git", "--repository", "C:\\Users\\manda\\Projects\\mcp-router"]
+    args: ["mcp-server-git", "--repository", "/path/to/your/repo"]
 
   - name: arxiv
     command: uvx
     args: ["arxiv-mcp-server"]
 
-  # ponytail: Windows — npx это .cmd, MCP SDK юзает create_subprocess_exec без shell.
-  # Поэтому cmd /c npx вместо просто npx.
+  # Windows: npx is a .cmd file — Python subprocess can't find it without a shell.
+  # Use "cmd /c npx" instead of just "npx".
   - name: context7
     command: cmd
     args: ["/c", "npx", "-y", "@upstash/context7-mcp@latest"]
 
   - name: filesystem
     command: cmd
-    args: ["/c", "npx", "-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\manda\\Projects\\mcp-router"]
+    args: ["/c", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
 
   - name: playwright
     command: cmd
@@ -39,8 +43,8 @@ downstream:
     command: cmd
     args: ["/c", "npx", "-y", "@modelcontextprotocol/server-memory"]
 
-# Настройки embeddings (Ollama)
+# Embeddings settings (Ollama)
 embeddings:
   ollama_url: "http://127.0.0.1:11434/api/embeddings"
   model: "nomic-embed-text"
-  top_n: 10
+  top_n: 10  # how many relevant tools to return per select call
