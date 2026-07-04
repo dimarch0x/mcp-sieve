@@ -7,6 +7,11 @@
   4. tools/list отдаёт уже релевантные tools
   5. LLM вызывает tool напрямую → router проксирует на downstream
 
+Путь 2 (mcp_router_call):
+  Для клиентов с замороженным toolset (например, Hermes с prompt caching):
+  1. LLM вызывает mcp_router_select(task="...") → получает список подходящих инструментов с их inputSchema.
+  2. LLM вызывает mcp_router_call(tool_name="...", arguments={...}) для выполнения выбранного инструмента.
+
 ponytail: один файл, всё в нём. Refactor когда стабильно.
 """
 import asyncio
@@ -155,6 +160,29 @@ ROUTER_SELECT_TOOL = Tool(
     },
 )
 
+ROUTER_CALL_TOOL = Tool(
+    name="mcp_router_call",
+    description=(
+        "Execute a downstream tool by name. Use after mcp_router_select "
+        "to find the right tool, then call this with the tool_name and "
+        "arguments from the select response."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "tool_name": {
+                "type": "string",
+                "description": "Tool name from mcp_router_select response (e.g. 'time_get_current_time').",
+            },
+            "arguments": {
+                "type": "object",
+                "description": "Arguments object matching the tool's inputSchema.",
+            },
+        },
+        "required": ["tool_name", "arguments"],
+    },
+)
+
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
@@ -174,11 +202,49 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent] | li
     # ponytail: insurance — если клиент передаёт prefixed name, стрипаем
     if name.startswith("mcp_router_"):
         stripped = name[len("mcp_router_"):]
-        if stripped == "mcp_router_select" or stripped in tool_registry:
+        if stripped in ("mcp_router_select", "mcp_router_call") or stripped in tool_registry:
             name = stripped
 
     if name == "mcp_router_select":
         return await _handle_select(args.get("task", ""))
+
+    if name == "mcp_router_call":
+        tool_name = args.get("tool_name", "")
+        tool_args = args.get("arguments", {})
+        if isinstance(tool_args, str):
+            try:
+                tool_args = json.loads(tool_args)
+            except Exception as e:
+                return _text(json.dumps({"error": f"failed to parse arguments JSON: {e}"}, ensure_ascii=False))
+
+        if not tool_name:
+            return _text(json.dumps({"error": "tool_name is required"}, ensure_ascii=False))
+
+        # Стрипаем префикс mcp_router_ если модель передала его в имени целевого инструмента
+        if tool_name.startswith("mcp_router_"):
+            tool_name = tool_name[len("mcp_router_"):]
+
+        if tool_name not in tool_registry:
+            # Пробуем найти без префиксов вообще (например, если модель передала 'time_get_current_time' вместо 'mcp-server-time_time_get_current_time')
+            found = False
+            for reg_name in tool_registry:
+                if reg_name.endswith(tool_name):
+                    tool_name = reg_name
+                    found = True
+                    break
+            if not found:
+                return _text(json.dumps({"error": f"unknown tool: {tool_name}"}, ensure_ascii=False))
+
+        ds_name, orig_name, ns_tool = tool_registry[tool_name]
+        session = downstream_sessions.get(ds_name)
+        if session is None:
+            return _text(f"downstream session {ds_name} not available")
+        try:
+            result: CallToolResult = await session.call_tool(orig_name, tool_args)
+            return result.content
+        except Exception as e:
+            log.exception("downstream call failed: %s/%s", ds_name, orig_name)
+            return _text(json.dumps({"error": f"downstream call failed: {e}"}, ensure_ascii=False))
 
     if name in tool_registry:
         ds_name, orig_name, ns_tool = tool_registry[name]
@@ -212,10 +278,18 @@ async def _handle_select(task: str) -> list[TextContent]:
 
     if not embeddings_cache:
         # нет embeddings — отдаём все tools, не ломая flow
-        _set_current_tools([ns_tool for _, _, ns_tool in tool_registry.values()])
+        all_ns_tools = [ns_tool for _, _, ns_tool in tool_registry.values()]
+        _set_current_tools(all_ns_tools)
         return _text(json.dumps({
             "warning": "embeddings unavailable; returning all tools",
-            "tools": [{"name": t.name, "description": t.description} for t in current_tools],
+            "tools": [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": t.inputSchema
+                } for t in all_ns_tools
+            ],
+            "hint": "Use mcp_router_call(tool_name=<name>, arguments=<args>) to execute any of these tools.",
         }, ensure_ascii=False))
 
     q_vec = await embed(task)
@@ -239,17 +313,23 @@ async def _handle_select(task: str) -> list[TextContent]:
         log.warning("could not send list_changed: %s", e)
 
     payload = {
-        "selected_tools": [{"name": t.name, "description": t.description} for t in top],
-        "hint": "tools/list has been updated — call them directly now.",
+        "selected_tools": [
+            {
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": t.inputSchema
+            } for t in top
+        ],
+        "hint": "Use mcp_router_call(tool_name=<name>, arguments=<args>) to execute any of these tools.",
     }
     return _text(json.dumps(payload, ensure_ascii=False))
 
 
 def _set_current_tools(tools: list[Tool]) -> None:
-    """Обновить current_tools. Всегда держим mcp_router_select первым."""
+    """Обновить current_tools. Всегда держим mcp_router_select и mcp_router_call первыми."""
     global current_tools
-    others = [t for t in tools if t.name != "mcp_router_select"]
-    current_tools = [ROUTER_SELECT_TOOL] + others
+    others = [t for t in tools if t.name not in ("mcp_router_select", "mcp_router_call")]
+    current_tools = [ROUTER_SELECT_TOOL, ROUTER_CALL_TOOL] + others
 
 
 # --- Entrypoint --------------------------------------------------------------
