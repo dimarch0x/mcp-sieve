@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from pathlib import Path
 
 import httpx
@@ -34,14 +35,29 @@ log = logging.getLogger("mcp-router")
 
 # --- Config ------------------------------------------------------------------
 
-# src/mcp_router/server.py → project root = parent.parent.parent
-CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config.yaml"
+# ponytail: при запуске через uvx --from <project> пакет стоит в uv-cache,
+# __file__ указывает туда. Ищем config.yaml: (1) env MCP_ROUTER_CONFIG,
+# (2) рядом с CWD, (3) fallback на старый путь relative-to-source.
+def _find_config() -> Path:
+    env = os.environ.get("MCP_ROUTER_CONFIG")
+    if env:
+        p = Path(env).expanduser()
+        if p.exists():
+            return p
+    cwd_cfg = Path.cwd() / "config.yaml"
+    if cwd_cfg.exists():
+        return cwd_cfg
+    src_cfg = Path(__file__).resolve().parent.parent.parent / "config.yaml"
+    return src_cfg
+
+CONFIG_PATH = _find_config()
 
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
-        log.warning("config.yaml не найден, использую пустой downstream")
+        log.warning("config.yaml не найден (%s), использую пустой downstream", CONFIG_PATH)
         return {"downstream": [], "embeddings": {}}
+    log.info("loading config: %s", CONFIG_PATH)
     return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
