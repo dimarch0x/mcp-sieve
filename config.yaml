@@ -9,10 +9,6 @@ downstream:
     command: uvx
     args: ["mcp-server-fetch"]
 
-  - name: sqlite
-    command: uvx
-    args: ["mcp-server-sqlite", "--db-path", "C:\\Users\\manda\\Projects\\mcp-router\\test.db"]
-
   # ponytail: Windows — npx это .cmd, MCP SDK юзает create_subprocess_exec без shell.
   # Поэтому cmd /c npx вместо просто npx.
   - name: context7
