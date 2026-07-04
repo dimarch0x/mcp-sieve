@@ -9,6 +9,14 @@ downstream:
     command: uvx
     args: ["mcp-server-fetch"]
 
+  - name: git
+    command: uvx
+    args: ["mcp-server-git", "--repository", "C:\\Users\\manda\\Projects\\mcp-router"]
+
+  - name: arxiv
+    command: uvx
+    args: ["arxiv-mcp-server"]
+
   # ponytail: Windows — npx это .cmd, MCP SDK юзает create_subprocess_exec без shell.
   # Поэтому cmd /c npx вместо просто npx.
   - name: context7
@@ -18,6 +26,18 @@ downstream:
   - name: filesystem
     command: cmd
     args: ["/c", "npx", "-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\manda\\Projects\\mcp-router"]
+
+  - name: playwright
+    command: cmd
+    args: ["/c", "npx", "-y", "@playwright/mcp@latest"]
+
+  - name: sequential-thinking
+    command: cmd
+    args: ["/c", "npx", "-y", "@modelcontextprotocol/server-sequential-thinking"]
+
+  - name: memory
+    command: cmd
+    args: ["/c", "npx", "-y", "@modelcontextprotocol/server-memory"]
 
 # Настройки embeddings (Ollama)
 embeddings:
