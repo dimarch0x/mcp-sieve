@@ -1,0 +1,13 @@
+# MCP Router configuration
+# Downstream MCP-серверы, которые роутер будет агрегировать.
+# Убери/добавь под себя. Для старта — один пример (time server).
+downstream:
+  - name: time
+    command: uvx
+    args: ["mcp-server-time"]
+
+# Настройки embeddings (Ollama)
+embeddings:
+  ollama_url: "http://127.0.0.1:11434/api/embeddings"
+  model: "nomic-embed-text"  # маленькая, быстрая; установи: ollama pull nomic-embed-text
+  top_n: 10  # сколько релевантных tools отдавать LLM
