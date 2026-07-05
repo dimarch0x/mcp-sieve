@@ -24,9 +24,9 @@ downstream MCP servers (time, fetch, git, arxiv, playwright, ...)
 ## Install
 
 ```bash
-git clone <repo> ~/Projects/mcp-sieve
-cd ~/Projects/mcp-sieve
-uv pip install -e .
+pip install mcp-sieve
+# or
+uvx mcp-sieve          # run without installing
 ```
 
 Requires [Ollama](https://ollama.com) with an embed model:
@@ -56,16 +56,16 @@ In `~/.claude.json` → `projects["<path>"].mcpServers`:
 "sieve": {
   "type": "stdio",
   "command": "uvx",
-  "args": ["--from", "/path/to/mcp-sieve", "mcp-sieve"],
+  "args": ["mcp-sieve"],
   "env": {
-    "MCP_ROUTER_CONFIG": "/path/to/mcp-sieve/config.yaml"
+    "MCP_ROUTER_CONFIG": "/path/to/config.yaml"
   }
 }
 ```
 
 Or via CLI:
 ```bash
-claude mcp add sieve -- uvx --from /path/to/mcp-sieve mcp-sieve
+claude mcp add sieve -- uvx mcp-sieve
 ```
 
 > **Windows:** `MCP_ROUTER_CONFIG` is required — `uvx` installs the package into an isolated venv, `__file__` points into uv-cache. See [Windows notes](#windows-notes) below.
@@ -73,7 +73,7 @@ claude mcp add sieve -- uvx --from /path/to/mcp-sieve mcp-sieve
 ## Connect to Hermes
 
 ```bash
-hermes mcp add sieve --command uvx --args "--from" --args "/path/to/mcp-sieve" --args "mcp-sieve"
+hermes mcp add sieve --command uvx --args "mcp-sieve"
 hermes mcp test sieve
 # /reset in chat
 ```
@@ -128,7 +128,7 @@ Crashed downstream servers (Ollama, npx) auto-reconnect with exponential backoff
 
 1. **npx → `cmd /c npx`:** `npx` is a `.cmd` file, Python subprocess (MCP SDK) can't find it without a shell. `uvx` is a real binary, works directly.
 
-2. **uvx --from and dependencies:** `uvx --from <project>` installs the package into an isolated uv-cache venv. All imports must be in `pyproject.toml` `[project.dependencies]` — implicit deps from the dev env won't be picked up.
+2. **uvx isolated venv:** `uvx mcp-sieve` installs into an isolated uv-cache venv. All imports must be in `pyproject.toml` `[project.dependencies]` — implicit deps from the dev env won't be picked up.
 
 3. **uv cache clean:** if the cache is locked (`os error 32`), kill MCP server processes first:
    ```bash
