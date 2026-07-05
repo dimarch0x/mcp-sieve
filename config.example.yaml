@@ -43,6 +43,17 @@ downstream:
     command: cmd
     args: ["/c", "npx", "-y", "@modelcontextprotocol/server-memory"]
 
+  # Remote MCP over HTTP (streamable) or SSE — no local process spawned.
+  # `transport` defaults to stdio; a bare `url` implies http.
+  - name: gitmcp
+    transport: http          # or: sse
+    url: "https://gitmcp.io/docs"
+
+# Env-var config (Docker/k8s, no file): MCP_SIEVE_DOWNSTREAM_1_NAME,
+# _COMMAND, _ARGS (JSON array or whitespace-split), _URL, _TRANSPORT.
+# N starts at 1 and stops at the first gap. Same-named env entry overrides yaml.
+# Also: MCP_SIEVE_OLLAMA_URL, MCP_SIEVE_EMBED_MODEL, MCP_SIEVE_TOP_N.
+
 # Embeddings settings (Ollama)
 embeddings:
   ollama_url: "http://127.0.0.1:11434/api/embeddings"
