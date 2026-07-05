@@ -14,17 +14,18 @@
 
 ## Benchmark
 
-Tested with **9 downstream servers (74 tools)** in Claude Code across 5 long tasks:
+Tested with **10 downstream servers (79 tools)** in Claude Code across 5 long tasks:
 
 | Metric | Result |
 |--------|--------|
 | `mcp_router_select` latency | 83–166ms |
 | `mcp_router_call` latency | 15–774ms |
-| Startup (9 servers + 74 embeddings) | ~16s |
+| Startup (10 servers + 79 embeddings) | ~16–18s |
 | Tools in LLM system prompt | 2 (always) |
 | Router accuracy (relevant tool in top-10) | 100% across test tasks |
+| Remote HTTP transport | verified (GitMCP via streamable_http) |
 
-**Downstream servers tested:** time, fetch, git, arxiv, context7, filesystem, playwright, sequential-thinking, memory
+**Downstream servers tested:** time, fetch, git, arxiv, context7, filesystem, playwright, sequential-thinking, memory, gitmcp (HTTP)
 
 **Observation:** Claude Code prefers native tools when they overlap (Bash vs git MCP, Write vs filesystem MCP). The router is most valuable for tools without native equivalents — arxiv, playwright, memory, context7.
 

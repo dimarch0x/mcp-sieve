@@ -1,8 +1,21 @@
 [project]
 name = "mcp-sieve"
 version = "0.1.0"
-description = "MCP Sieve — semantic tool selection proxy for LLMs"
+description = "MCP Sieve — semantic tool selection proxy for LLMs. Aggregates downstream MCP servers into 2 static tools (select + call) via Ollama embeddings."
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
+authors = [{ name = "dimarch0x" }]
+keywords = ["mcp", "mcp-server", "semantic-routing", "llm", "ollama", "tool-selection"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = [
     "mcp>=1.0.0",
     "httpx>=0.27.0",
@@ -10,8 +23,20 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/dimarch0x/mcp-sieve"
+Repository = "https://github.com/dimarch0x/mcp-sieve"
+Issues = "https://github.com/dimarch0x/mcp-sieve/issues"
+
 [project.scripts]
 mcp-sieve = "mcp_router.server:main"
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [tool.uv]
 package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_router"]
